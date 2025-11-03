@@ -256,26 +256,6 @@ def load_ruperto_config():
         config = json.load(f)
         return config
 
-def calculate_local_md5(filepath):
-    """Calcula el checksum MD5 de un archivo local"""
-    if not os.path.exists(filepath):
-        return None
-    
-    hash_md5 = hashlib.md5()
-    try:
-        with open(filepath, "rb") as f:
-            # Leer en chunks para archivos grandes
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-    except IOError:
-        print_warning(f"No se pudo leer el archivo local: {filepath}")
-        return None
-    except Exception as e:
-        print_error(f"Error calculando MD5 para {filepath}: {e}")
-        return None
-
-    return hash_md5.hexdigest()
-
 def load_gitignore_patterns(folder_path):
     """Carga todos los .gitignore en la carpeta y subcarpetas"""
     gitignore_specs = {}
@@ -367,100 +347,75 @@ def download_folder_recursive(service, folder_id, destination_path, stats, depth
             download_file(service, item_id, item_path, item_name)
 
 def download_command(service, folder_path):
-    """Descarga cambios desde Drive, comparando MD5"""
+    """Descarga cambios desde Drive, sobreescribiendo archivos locales"""
     metadata = load_ruperto_metadata(folder_path)
     
     if not metadata:
         print_error(f"No se encontró {RUPERTO_FILE} en la carpeta actual")
-        print_info(f"Esta carpeta no fue clonada con rupertoCLI")
+        print_info("Esta carpeta no fue clonada con RupertoCLI")
         return
     
     folder_id = metadata['folder_id']
     folder_name = metadata['folder_name']
     
     print_info(f"Descargando cambios de: {Colors.BOLD}{folder_name}{Colors.ENDC}")
+    print_warning("Los cambios locales serán sobreescritos\n")
     
     print_info("Obteniendo estado de Google Drive...")
     remote_files = get_remote_files_map(service, folder_id)
     local_files = get_local_files_map(folder_path)
     
     to_download = []
-    to_delete_local = []
-    skipped_count = 0
+    to_delete = []
     
-    # 1. Identificar archivos para descargar/actualizar
     for rel_path, remote_info in remote_files.items():
-        if remote_info.get('is_folder'):
-            continue
-            
-        local_path = os.path.join(folder_path, rel_path)
-        remote_md5 = remote_info.get('md5')
-        
-        if not os.path.exists(local_path):
-            # Archivo existe en Drive pero no localmente (Nuevo)
-            to_download.append((rel_path, remote_info, "Nuevo"))
-        else:
-            # Archivo existe, comparar MD5
-            local_md5 = calculate_local_md5(local_path)
-            
-            if local_md5 != remote_md5:
-                # Archivo modificado
-                to_download.append((rel_path, remote_info, "Modificado"))
-            else:
-                # Archivo idéntico
-                skipped_count += 1
-
-    # 2. Identificar archivos locales para eliminar
+        if not remote_info.get('is_folder'):
+            to_download.append((rel_path, remote_info))
+    
     for rel_path in local_files:
         if rel_path not in remote_files and not local_files[rel_path]['is_folder']:
-            to_delete_local.append(rel_path)
-            
-    if not to_download and not to_delete_local:
-        print_success(f"Todo está sincronizado. {skipped_count} archivos idénticos.")
+            to_delete.append(rel_path)
+    
+    if not to_download and not to_delete:
+        print_success("Todo está sincronizado. No hay cambios.")
         save_ruperto_metadata(folder_path, folder_id, folder_name, remote_files)
         return
-        
+    
     print(f"\n{Colors.BOLD}Resumen:{Colors.ENDC}")
     print(f"  {Colors.GREEN}A descargar/actualizar:{Colors.ENDC} {len(to_download)}")
-    print(f"  {Colors.RED}A eliminar localmente:{Colors.ENDC} {len(to_delete_local)}")
-    print(f"  {Colors.DIM}Idénticos (omitidos):{Colors.ENDC} {skipped_count}\n")
+    print(f"  {Colors.RED}A eliminar:{Colors.ENDC} {len(to_delete)}\n")
     
     if to_download:
         print(f"{Colors.BOLD}Descargando archivos...{Colors.ENDC}")
-        for rel_path, remote_info, reason in to_download:
+        for rel_path, remote_info in to_download:
             local_path = os.path.join(folder_path, rel_path)
-            print_download(f"({reason}) {rel_path}")
+            print_download(f"{rel_path}")
             download_file(service, remote_info['id'], local_path, remote_info['name'])
-            
-    if to_delete_local:
+    
+    if to_delete:
         print(f"\n{Colors.BOLD}Eliminando archivos locales...{Colors.ENDC}")
-        for rel_path in to_delete_local:
+        for rel_path in to_delete:
             local_path = os.path.join(folder_path, rel_path)
             print_delete(f"{rel_path}")
             if os.path.exists(local_path):
                 os.remove(local_path)
     
-    # Limpiar carpetas vacías
     for root, dirs, files in os.walk(folder_path, topdown=False):
         for dir_name in dirs:
             dir_path = os.path.join(root, dir_name)
             if not os.listdir(dir_path):
-                try:
-                    os.rmdir(dir_path)
-                except OSError as e:
-                    print_warning(f"No se pudo eliminar la carpeta vacía {dir_path}: {e}")
-                
+                os.rmdir(dir_path)
+    
     save_ruperto_metadata(folder_path, folder_id, folder_name, remote_files)
     print(f"\n{Colors.GREEN}{Colors.BOLD}✓ Descarga completada!{Colors.ENDC}\n")
 
 def upload_command(service, folder_path):
-    """Sube cambios locales a Drive, comparando MD5"""
+    """Sube cambios locales a Drive, sobreescribiendo archivos remotos"""
     metadata = load_ruperto_metadata(folder_path)
     
     if not metadata:
-        # --- Lógica de primera subida (sin cambios) ---
         print_warning(f"No se encontró {RUPERTO_FILE} en la carpeta actual")
-        print_info(f"Esta carpeta no fue clonada con rupertoCLI\n")
+        print_info("Esta carpeta no fue clonada con RupertoCLI\n")
         
         print(f"{Colors.BOLD}¿Deseas subir esta carpeta a Google Drive?{Colors.ENDC}")
         print(f"{Colors.DIM}Se creará como una nueva carpeta en Drive{Colors.ENDC}\n")
@@ -489,17 +444,14 @@ def upload_command(service, folder_path):
             print_error(f"Error al crear la carpeta: {e}")
             print_info("Verifica que el link sea correcto y tengas permisos")
             return
-        # --- Fin de lógica de primera subida ---
-
+    
     folder_id = metadata['folder_id']
     folder_name = metadata['folder_name']
     
-    # Archivos remotos de la *última sincronización* (nuestra "base")
-    remote_files_cache = metadata.get('files', {})
-    
     print_info(f"Subiendo cambios a: {Colors.BOLD}{folder_name}{Colors.ENDC}")
+    print_warning("Los archivos en Drive serán sobreescritos\n")
     
-    print_info(f"Cargando configuración de rupertoCLI...")
+    print_info("Cargando configuración de RupertoCLI...")
     config = load_ruperto_config()
     keep_patterns = config.get('keep', [])
     
@@ -514,70 +466,42 @@ def upload_command(service, folder_path):
     
     print_info("Analizando cambios locales...")
     local_files = get_local_files_map(folder_path)
+    remote_files = get_remote_files_map(service, folder_id)
     
     folders_to_create = []
     files_to_upload = []
-    files_to_delete_remote = []
+    files_to_delete = []
     ignored_count = 0
-    skipped_count = 0
     
-    # Mapa para guardar los IDs de las carpetas (locales y remotas)
     folder_ids = {'.': folder_id}
-    for rel_path, remote_info in remote_files_cache.items():
-        if remote_info.get('is_folder'):
-            folder_ids[rel_path] = remote_info['id']
-            
-    # 1. Identificar carpetas a crear y archivos para subir/actualizar
+    
     for rel_path in sorted(local_files.keys()):
         local_info = local_files[rel_path]
         
         if local_info['is_folder']:
-            if rel_path not in remote_files_cache:
+            if rel_path not in remote_files:
                 folders_to_create.append(rel_path)
         else:
-            # Es un archivo
             if should_ignore_file(rel_path, gitignore_specs, keep_patterns):
                 ignored_count += 1
                 continue
             
-            local_path = local_info['path']
-            remote_file_info = remote_files_cache.get(rel_path)
-            
-            if not remote_file_info:
-                # Archivo es nuevo localmente
-                files_to_upload.append((rel_path, "Nuevo"))
-            else:
-                # Archivo existe, comparar MD5
-                local_md5 = calculate_local_md5(local_path)
-                remote_md5 = remote_file_info.get('md5')
-                
-                if local_md5 != remote_md5:
-                    # Archivo modificado
-                    files_to_upload.append((rel_path, "Modificado"))
-                else:
-                    # Archivo idéntico
-                    skipped_count += 1
-
-    # 2. Identificar archivos remotos para eliminar
-    for rel_path, remote_info in remote_files_cache.items():
-        if remote_info.get('is_folder'):
-            continue
-            
-        if rel_path not in local_files:
-            # Archivo existe en Drive pero no localmente (Eliminado)
-            files_to_delete_remote.append((rel_path, remote_info['id']))
-            
-    if not folders_to_create and not files_to_upload and not files_to_delete_remote:
-        print_success(f"Todo está sincronizado. {skipped_count} archivos idénticos.")
+            files_to_upload.append(rel_path)
+    
+    for rel_path, remote_info in remote_files.items():
+        if rel_path not in local_files and not remote_info.get('is_folder'):
+            files_to_delete.append((rel_path, remote_info['id']))
+    
+    if not folders_to_create and not files_to_upload and not files_to_delete:
+        print_success("Todo está sincronizado. No hay cambios.")
         if ignored_count > 0:
             print_info(f"Archivos ignorados por .gitignore: {Colors.DIM}{ignored_count}{Colors.ENDC}")
         return
-        
+    
     print(f"\n{Colors.BOLD}Resumen:{Colors.ENDC}")
     print(f"  {Colors.YELLOW}Carpetas a crear:{Colors.ENDC} {len(folders_to_create)}")
     print(f"  {Colors.CYAN}Archivos a subir/actualizar:{Colors.ENDC} {len(files_to_upload)}")
-    print(f"  {Colors.RED}Archivos a eliminar en Drive:{Colors.ENDC} {len(files_to_delete_remote)}")
-    print(f"  {Colors.DIM}Idénticos (omitidos):{Colors.ENDC} {skipped_count}")
+    print(f"  {Colors.RED}Archivos a eliminar:{Colors.ENDC} {len(files_to_delete)}")
     if ignored_count > 0:
         print(f"  {Colors.DIM}Ignorados por .gitignore:{Colors.ENDC} {ignored_count}")
     print()
@@ -591,30 +515,32 @@ def upload_command(service, folder_path):
             folder_name_only = os.path.basename(rel_path)
             print_info(f"Creando carpeta: {rel_path}")
             new_folder_id = create_folder(service, folder_name_only, parent_id)
-            folder_ids[rel_path] = new_folder_id # Guardar ID para sub-carpetas/archivos
+            folder_ids[rel_path] = new_folder_id
+    
+    for rel_path, remote_info in remote_files.items():
+        if remote_info.get('is_folder'):
+            folder_ids[rel_path] = remote_info['id']
     
     if files_to_upload:
         print(f"\n{Colors.BOLD}Subiendo archivos...{Colors.ENDC}")
-        for rel_path, reason in files_to_upload:
+        for rel_path in files_to_upload:
             local_path = local_files[rel_path]['path']
             parent_path = os.path.dirname(rel_path) if os.path.dirname(rel_path) else '.'
             parent_id = folder_ids.get(parent_path, folder_id)
             file_name = os.path.basename(rel_path)
             
-            # ID existente (si se está actualizando)
-            existing_id = remote_files_cache.get(rel_path, {}).get('id')
+            existing_id = remote_files.get(rel_path, {}).get('id')
             
-            print_upload(f"({reason}) {rel_path}")
+            print_upload(f"{rel_path}")
             upload_file(service, local_path, parent_id, file_name, existing_id)
-            
-    if files_to_delete_remote:
+    
+    if files_to_delete:
         print(f"\n{Colors.BOLD}Eliminando archivos en Drive...{Colors.ENDC}")
-        for rel_path, file_id in files_to_delete_remote:
+        for rel_path, file_id in files_to_delete:
             print_delete(f"{rel_path}")
             delete_file(service, file_id)
-            
+    
     print_info("\nActualizando metadatos...")
-    # Después de todos los cambios, obtener el nuevo estado real de Drive
     remote_files = get_remote_files_map(service, folder_id)
     save_ruperto_metadata(folder_path, folder_id, folder_name, remote_files)
     
@@ -624,7 +550,7 @@ def clone_command(folder_link):
     """Comando para clonar una carpeta de Google Drive"""
     folder_id = extract_folder_id(folder_link)
     
-    print_header("rupertoCLI - Clone")
+    print_header("RupertoCLI - Clone")
     
     print_info("Autenticando con Google Drive...")
     creds = authenticate()
@@ -660,8 +586,8 @@ def clone_command(folder_link):
     print(f"{Colors.DIM}Archivos guardados en: {destination}{Colors.ENDC}\n")
 
 def show_help():
-    """Muestra la ayuda de rupertoCLI"""
-    print_header("rupertoCLI - Google Drive Sync Tool")
+    """Muestra la ayuda de RupertoCLI"""
+    print_header("RupertoCLI - Google Drive Sync Tool")
     print(f"{Colors.BOLD}Comandos disponibles:{Colors.ENDC}\n")
     
     print(f"  {Colors.CYAN}clone{Colors.ENDC} <link>")
@@ -669,12 +595,14 @@ def show_help():
     print(f"    {Colors.DIM}Ejemplo: python main.py clone https://drive.google.com/drive/folders/...{Colors.ENDC}\n")
     
     print(f"  {Colors.CYAN}download{Colors.ENDC}")
-    print(f"    Descarga solo los cambios desde Drive (compara MD5)")
-    print(f"    {Colors.DIM}Debe ejecutarse dentro de una carpeta clonada{Colors.ENDC}\n")
+    print(f"    Descarga cambios desde Drive y sobreescribe archivos locales")
+    print(f"    {Colors.DIM}Debe ejecutarse dentro de una carpeta clonada{Colors.ENDC}")
+    print(f"    {Colors.YELLOW}⚠ Los cambios locales se perderán{Colors.ENDC}\n")
     
     print(f"  {Colors.CYAN}upload{Colors.ENDC}")
-    print(f"    Sube solo los cambios locales a Drive (compara MD5)")
-    print(f"    {Colors.DIM}Debe ejecutarse dentro de una carpeta clonada{Colors.ENDC}\n")
+    print(f"    Sube cambios locales a Drive y sobreescribe archivos remotos")
+    print(f"    {Colors.DIM}Debe ejecutarse dentro de una carpeta clonada{Colors.ENDC}")
+    print(f"    {Colors.YELLOW}⚠ Los archivos en Drive se sobreescribirán{Colors.ENDC}\n")
     
     print(f"  {Colors.CYAN}help{Colors.ENDC}")
     print(f"    Muestra esta ayuda\n")
@@ -694,14 +622,14 @@ def main():
         clone_command(sys.argv[2])
     
     elif command == 'download':
-        print_header("rupertoCLI - Download")
+        print_header("RupertoCLI - Download")
         print_info("Autenticando con Google Drive...")
         creds = authenticate()
         service = build('drive', 'v3', credentials=creds)
         download_command(service, os.getcwd())
     
     elif command == 'upload':
-        print_header("rupertoCLI - Upload")
+        print_header("RupertoCLI - Upload")
         print_info("Autenticando con Google Drive...")
         creds = authenticate()
         service = build('drive', 'v3', credentials=creds)
