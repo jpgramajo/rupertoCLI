@@ -91,6 +91,20 @@ def get_script_dir():
         # Estamos en un script normal
         return os.path.dirname(os.path.realpath(__file__))
 
+def get_local_md5(filepath):
+    """Calcula el MD5 de un archivo local. Devuelve None si no existe."""
+    if not os.path.exists(filepath):
+        return None
+    hash_md5 = hashlib.md5()
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except IOError:
+        print_warning(f"No se pudo leer el archivo local: {filepath}")
+        return None
+
 def authenticate():
     """Autentica con Google Drive API y guarda el token"""
     creds = None
@@ -145,11 +159,13 @@ def upload_file(service, file_path, parent_id, file_name, file_id=None, show_pro
     media = MediaFileUpload(file_path, resumable=True)
     
     if file_id:
+        # Actualizar archivo existente
         request = service.files().update(
             fileId=file_id,
             media_body=media
         )
     else:
+        # Crear archivo nuevo
         file_metadata = {
             'name': file_name,
             'parents': [parent_id]
@@ -186,7 +202,9 @@ def delete_file(service, file_id):
     service.files().delete(fileId=file_id).execute()
 
 def get_remote_files_map(service, folder_id, base_path=""):
-    """Obtiene un mapa de todos los archivos remotos con sus metadatos"""
+    """
+    Obtiene un mapa de todos los archivos remotos con sus metadatos (incluyendo md5Checksum)
+    """
     files_map = {}
     page_token = None
     
@@ -194,7 +212,7 @@ def get_remote_files_map(service, folder_id, base_path=""):
         query = f"'{folder_id}' in parents and trashed=false"
         results = service.files().list(
             q=query,
-            fields="nextPageToken, files(id, name, mimeType, modifiedTime, md5Checksum, size)",
+            fields="nextPageToken, files(id, name, mimeType, modifiedTime, md5Checksum, size)", # MD5CHECKSUM ES CLAVE
             pageSize=1000,
             pageToken=page_token
         ).execute()
@@ -219,7 +237,7 @@ def get_remote_files_map(service, folder_id, base_path=""):
                     'id': item['id'],
                     'name': item_name,
                     'modified': item.get('modifiedTime'),
-                    'md5': item.get('md5Checksum'),
+                    'md5': item.get('md5Checksum'), # ¡Aquí está!
                     'size': item.get('size'),
                     'mimeType': item['mimeType'],
                     'is_folder': False
@@ -282,14 +300,16 @@ def get_local_files_map(folder_path, gitignore_specs, keep_patterns, ignore_patt
     
     return files_map, ignored_file_count
 
-def save_ruperto_metadata(folder_path, folder_id, folder_name, files_map):
-    """Guarda los metadatos en ruperto.json"""
+def save_ruperto_metadata(folder_path, folder_id, folder_name):
+    """
+    Guarda los metadatos mínimos en ruperto.json (solo IDs).
+    El mapa de archivos ya no es necesario.
+    """
     metadata = {
-        'version': '1.0',
+        'version': '1.1-md5', # Versión actualizada
         'folder_id': folder_id,
         'folder_name': folder_name,
-        'last_sync': datetime.now().isoformat(),
-        'files': files_map
+        'last_sync': datetime.now().isoformat()
     }
     
     ruperto_path = os.path.join(folder_path, RUPERTO_FILE)
@@ -424,47 +444,6 @@ def count_items(service, folder_id):
             
     return count
 
-def download_folder_recursive(service, folder_id, destination_path, stats, depth=0):
-    """Descarga recursivamente todos los archivos y subcarpetas (DEPRECATED by download_command)"""
-    query = f"'{folder_id}' in parents and trashed=false"
-    page_token = None
-    indent = "  " * depth
-
-    while True:
-        results = service.files().list(
-            q=query,
-            fields="nextPageToken, files(id, name, mimeType)",
-            pageSize=1000,
-            pageToken=page_token
-        ).execute()
-        
-        items = results.get('files', [])
-        
-        for item in items:
-            item_name = item['name']
-            item_id = item['id']
-            item_mime = item['mimeType']
-            item_path = os.path.join(destination_path, item_name)
-            
-            if item_mime == 'application/vnd.google-apps.folder':
-                safe_print(f"{indent}{Colors.YELLOW}📁 {item_name}/{Colors.ENDC}")
-                os.makedirs(item_path, exist_ok=True)
-                download_folder_recursive(service, item_id, item_path, stats, depth + 1)
-            else:
-                if item_mime.startswith('application/vnd.google-apps.'):
-                    continue
-                
-                with _download_progress_lock:
-                    _download_progress['current'] += 1
-                    current = _download_progress['current']
-                
-                safe_print(f"{indent}{Colors.CYAN}[{current}/{stats['total']}]{Colors.ENDC} {item_name}")
-                download_file(service, item_id, item_path, item_name)
-        
-        page_token = results.get('nextPageToken', None)
-        if page_token is None:
-            break
-
 def _download_worker(creds, remote_info, local_path, rel_path, total_files):
     """Trabajador para descargar un archivo en un hilo"""
     try:
@@ -479,12 +458,11 @@ def _download_worker(creds, remote_info, local_path, rel_path, total_files):
         safe_print(f" {Colors.CYAN}[{completed}/{total_files}]{Colors.ENDC} {Colors.GREEN}⬇{Colors.ENDC} {rel_path}")
         
         download_file(service, remote_info['id'], local_path, remote_info['name'], show_progress=False)
-        # print_success(f"Descargado: {rel_path}") # Opcional: demasiado verboso
     except Exception as e:
         print_error(f"Error al descargar {rel_path}: {e}")
 
 def download_command(service, folder_path, creds, config):
-    """Descarga cambios desde Drive, sobreescribiendo archivos locales (paralelo)"""
+    """Descarga cambios desde Drive, sobreescribiendo archivos locales (paralelo y con MD5)"""
     metadata = load_ruperto_metadata(folder_path)
     
     if not metadata:
@@ -496,52 +474,73 @@ def download_command(service, folder_path, creds, config):
     folder_name = metadata['folder_name']
     
     print_info(f"Descargando cambios de: {Colors.BOLD}{folder_name}{Colors.ENDC}")
-    print_warning("Los cambios locales serán sobreescritos\n")
+    print_warning("Los cambios locales modificados serán sobreescritos\n")
     
-    print_info("Obteniendo estado de Google Drive...")
+    print_info("Obteniendo estado de Google Drive (MD5)...")
     remote_files = get_remote_files_map(service, folder_id)
     
-    # Para 'download', no necesitamos filtrar archivos locales
-    local_files, _ = get_local_files_map(folder_path, {}, [], [])
+    print_info("Analizando estado local (MD5)...")
+    # Para 'download', no necesitamos filtrar archivos locales, solo obtener el mapa
+    local_files_map, _ = get_local_files_map(folder_path, {}, [], [])
     
     to_download = []
     to_delete = []
+    unchanged_count = 0
     
-    # Archivos a descargar/actualizar
+    # --- Lógica de Sincronización MD5 ---
+    
+    # 1. Archivos a descargar/actualizar
     for rel_path, remote_info in remote_files.items():
-        if not remote_info.get('is_folder'):
+        if remote_info.get('is_folder'):
+            continue # Ignorar carpetas aquí
+            
+        local_path = os.path.join(folder_path, rel_path.replace('/', os.sep))
+        local_md5 = get_local_md5(local_path)
+        remote_md5 = remote_info.get('md5')
+
+        if local_md5 is None:
+            # Archivo no existe localmente, descargar
             to_download.append((rel_path, remote_info))
-    
-    # Archivos locales a eliminar (no existen en remoto)
-    for rel_path in local_files:
-        if rel_path not in remote_files and not local_files[rel_path]['is_folder']:
+        elif local_md5 != remote_md5:
+            # Archivo modificado, descargar
+            to_download.append((rel_path, remote_info))
+        else:
+            # Archivo sin cambios
+            unchanged_count += 1
+
+    # 2. Archivos locales a eliminar (no existen en remoto)
+    for rel_path in local_files_map:
+        if rel_path not in remote_files and not local_files_map[rel_path]['is_folder']:
             to_delete.append(rel_path)
+
+    # --- Fin de Lógica MD5 ---
 
     if not to_download and not to_delete:
         print_success("Todo está sincronizado. No hay cambios.")
-        save_ruperto_metadata(folder_path, folder_id, folder_name, remote_files)
+        print_info(f"  {Colors.DIM}Archivos sin cambios: {unchanged_count}{Colors.ENDC}")
+        save_ruperto_metadata(folder_path, folder_id, folder_name) # Actualizar 'last_sync'
         return
     
     print(f"\n{Colors.BOLD}Resumen:{Colors.ENDC}")
-    print(f"  {Colors.GREEN}A descargar/actualizar:{Colors.ENDC} {len(to_download)}")
-    print(f"  {Colors.RED}A eliminar:{Colors.ENDC} {len(to_delete)}\n")
+    print(f"  {Colors.GREEN}A descargar (nuevos/modificados):{Colors.ENDC} {len(to_download)}")
+    print(f"  {Colors.RED}A eliminar (locales):{Colors.ENDC} {len(to_delete)}")
+    print(f"  {Colors.DIM}Archivos sin cambios:{Colors.ENDC} {unchanged_count}\n")
     
     if to_download:
-        print(f"{Colors.BOLD}Descargando archivos ({config.get('parallel_downloads', 8)} hilos)...{Colors.ENDC}")
+        parallel_downloads = config.get('parallel_downloads', 8)
+        print(f"{Colors.BOLD}Descargando archivos ({parallel_downloads} hilos)...{Colors.ENDC}")
         
         with _download_progress_lock:
             _download_progress['completed'] = 0
-            _download_progress['total'] = len(to_download)
         
         total_downloads = len(to_download)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=config.get('parallel_downloads', 8)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_downloads) as executor:
             futures = []
             for rel_path, remote_info in to_download:
                 local_path = os.path.join(folder_path, rel_path.replace('/', os.sep))
                 futures.append(executor.submit(_download_worker, creds, remote_info, local_path, rel_path, total_downloads))
             
-            # Esperar a que todos los futuros completen
             concurrent.futures.wait(futures)
 
     if to_delete:
@@ -555,16 +554,21 @@ def download_command(service, folder_path, creds, config):
     # Limpiar carpetas locales vacías
     print_info("Limpiando directorios vacíos...")
     for root, dirs, files in os.walk(folder_path, topdown=False):
+        # No eliminar directorios ignorados aunque estén vacíos (ej. .git)
+        rel_root = os.path.relpath(root, folder_path).replace(os.sep, '/')
+        if rel_root != '.' and should_ignore_file(rel_root, {}, [], config.get('ignore', []), is_dir=True):
+            continue
+
         for dir_name in dirs:
             dir_path = os.path.join(root, dir_name)
-            if not os.listdir(dir_path):
-                try:
+            try:
+                if not os.listdir(dir_path):
                     os.rmdir(dir_path)
                     print_delete(f"Directorio vacío: {os.path.relpath(dir_path, folder_path)}")
-                except OSError as e:
-                    print_warning(f"No se pudo eliminar {dir_path}: {e}")
+            except OSError as e:
+                print_warning(f"No se pudo eliminar {dir_path}: {e}")
     
-    save_ruperto_metadata(folder_path, folder_id, folder_name, remote_files)
+    save_ruperto_metadata(folder_path, folder_id, folder_name) # Actualizar 'last_sync'
     print(f"\n{Colors.GREEN}{Colors.BOLD}✓ Descarga completada!{Colors.ENDC}\n")
 
 # Almacén de datos para el callback de creación de carpetas en lote
@@ -597,17 +601,18 @@ def _upload_worker(creds, local_path, parent_id, file_name, existing_id, rel_pat
             completed = _upload_progress['completed']
         
         # Imprimir progreso general
-        safe_print(f" {Colors.CYAN}[{completed}/{total_files}]{Colors.ENDC} {Colors.CYAN}⬆{Colors.ENDC} {rel_path}")
+        action_color = Colors.CYAN if existing_id else Colors.GREEN
+        action_symbol = "⬆" if existing_id else "✚"
+        safe_print(f" {Colors.CYAN}[{completed}/{total_files}]{Colors.ENDC} {action_color}{action_symbol}{Colors.ENDC} {rel_path}")
         
         # Ejecutar la subida (sin la barra de progreso individual)
         upload_file(service, local_path, parent_id, file_name, existing_id, show_progress=False)
-        # print_success(f"Subido: {rel_path}") # Opcional: demasiado verboso
         
     except Exception as e:
         print_error(f"Error al subir {rel_path}: {e}")
 
 def upload_command(service, folder_path, creds, config):
-    """Sube cambios locales a Drive, sobreescribiendo archivos remotos"""
+    """Sube cambios locales a Drive (paralelo y con MD5)"""
     metadata = load_ruperto_metadata(folder_path)
     
     if not metadata:
@@ -633,7 +638,7 @@ def upload_command(service, folder_path, creds, config):
             print_success(f"Carpeta creada con ID: {new_folder_id}")
             
             print_info("Creando archivo de metadatos...")
-            save_ruperto_metadata(folder_path, new_folder_id, folder_name, {})
+            save_ruperto_metadata(folder_path, new_folder_id, folder_name) # Metadata mínima
             print_success(f"Archivo {RUPERTO_FILE} creado\n")
             
             metadata = load_ruperto_metadata(folder_path)
@@ -646,13 +651,11 @@ def upload_command(service, folder_path, creds, config):
     folder_name = metadata['folder_name']
     
     print_info(f"Subiendo cambios a: {Colors.BOLD}{folder_name}{Colors.ENDC}")
-    print_warning("Los archivos en Drive serán sobreescritos\n")
+    print_warning("Los archivos modificados en Drive serán sobreescritos\n")
     
     print_info("Cargando configuración de RupertoCLI...")
-    # config ya se pasó como argumento
     keep_patterns = config.get('keep', [])
     ignore_patterns = config.get('ignore', [])
-    
     print_info(f"  Patrones a mantener (config): {Colors.DIM}{', '.join(keep_patterns) or 'Ninguno'}{Colors.ENDC}")
     print_info(f"  Patrones a ignorar (config): {Colors.DIM}{', '.join(ignore_patterns) or 'Ninguno'}{Colors.ENDC}")
     
@@ -661,15 +664,16 @@ def upload_command(service, folder_path, creds, config):
     if gitignore_specs:
         print_info(f"  Encontrados {len(gitignore_specs)} archivo(s) .gitignore")
     
-    print_info("Analizando cambios locales...")
-    local_files, ignored_count = get_local_files_map(folder_path, gitignore_specs, keep_patterns, ignore_patterns)
+    print_info("Analizando cambios locales (calculando MD5)...")
+    local_files_map, ignored_count = get_local_files_map(folder_path, gitignore_specs, keep_patterns, ignore_patterns)
     
-    print_info("Obteniendo estado de Google Drive...")
+    print_info("Obteniendo estado de Google Drive (MD5)...")
     remote_files = get_remote_files_map(service, folder_id)
     
     folders_to_create = []
-    files_to_upload = []
-    files_to_delete = []
+    files_to_upload = [] # Lista de tuplas (rel_path, local_path, parent_id, file_name, existing_id)
+    files_to_delete = [] # Lista de tuplas (rel_path, file_id)
+    unchanged_files_count = 0
     
     # Mapa de IDs de carpetas (remotas y locales)
     folder_ids = {'.': folder_id}
@@ -678,29 +682,57 @@ def upload_command(service, folder_path, creds, config):
         if remote_info.get('is_folder'):
             folder_ids[rel_path] = remote_info['id']
 
-    for rel_path, local_info in local_files.items():
+    # --- Lógica de Sincronización MD5 ---
+
+    # 1. Archivos a subir y carpetas a crear
+    for rel_path, local_info in local_files_map.items():
         if local_info['is_folder']:
             if rel_path not in remote_files:
                 folders_to_create.append(rel_path)
         else: # Es archivo
-            files_to_upload.append(rel_path)
+            local_path = local_info['path']
+            local_md5 = get_local_md5(local_path)
             
+            remote_info = remote_files.get(rel_path)
+            
+            if local_md5 is None:
+                print_warning(f"No se pudo leer el archivo local {rel_path}, omitiendo.")
+                continue
+
+            if not remote_info:
+                # Archivo nuevo, subir
+                files_to_upload.append((rel_path, local_path, os.path.basename(rel_path), None))
+            elif local_md5 != remote_info.get('md5'):
+                # Archivo modificado, subir (actualizar)
+                files_to_upload.append((rel_path, local_path, os.path.basename(rel_path), remote_info['id']))
+            else:
+                # Archivo sin cambios
+                unchanged_files_count += 1
+            
+    # 2. Archivos remotos a eliminar
     for rel_path, remote_info in remote_files.items():
-        if rel_path not in local_files and not remote_info.get('is_folder'):
+        if rel_path not in local_files_map and not remote_info.get('is_folder'):
             files_to_delete.append((rel_path, remote_info['id']))
+            
+    # --- Fin de Lógica MD5 ---
             
     if not folders_to_create and not files_to_upload and not files_to_delete:
         print_success("Todo está sincronizado. No hay cambios.")
         if ignored_count > 0:
-            print_info(f"  Archivos ignorados (config + .gitignore): {Colors.DIM}{ignored_count}{Colors.ENDC}")
+            print_info(f"  {Colors.DIM}Archivos ignorados (config + .gitignore): {ignored_count}{Colors.ENDC}")
+        if unchanged_files_count > 0:
+            print_info(f"  {Colors.DIM}Archivos sin cambios (MD5): {unchanged_files_count}{Colors.ENDC}")
+        save_ruperto_metadata(folder_path, folder_id, folder_name) # Actualizar 'last_sync'
         return
         
     print(f"\n{Colors.BOLD}Resumen:{Colors.ENDC}")
     print(f"  {Colors.YELLOW}Carpetas a crear:{Colors.ENDC} {len(folders_to_create)}")
-    print(f"  {Colors.CYAN}Archivos a subir/actualizar:{Colors.ENDC} {len(files_to_upload)}")
-    print(f"  {Colors.RED}Archivos a eliminar:{Colors.ENDC} {len(files_to_delete)}")
+    print(f"  {Colors.CYAN}Archivos a subir (nuevos/modificados):{Colors.ENDC} {len(files_to_upload)}")
+    print(f"  {Colors.RED}Archivos a eliminar (en Drive):{Colors.ENDC} {len(files_to_delete)}")
     if ignored_count > 0:
         print(f"  {Colors.DIM}Ignorados (config + .gitignore):{Colors.ENDC} {ignored_count}")
+    if unchanged_files_count > 0:
+        print(f"  {Colors.DIM}Sin cambios (MD5):{Colors.ENDC} {unchanged_files_count}")
     print()
     
     if folders_to_create:
@@ -782,14 +814,12 @@ def upload_command(service, folder_path, creds, config):
         
         with _upload_progress_lock:
             _upload_progress['completed'] = 0
-            _upload_progress['total'] = len(files_to_upload)
         
         total_uploads = len(files_to_upload)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_uploads) as executor:
             futures = []
-            for rel_path in files_to_upload:
-                local_path = local_files[rel_path]['path']
+            for rel_path, local_path, file_name, existing_id in files_to_upload:
                 parent_path = os.path.dirname(rel_path)
                 if parent_path == '':
                     parent_path = '.'
@@ -797,15 +827,11 @@ def upload_command(service, folder_path, creds, config):
                 parent_id = folder_ids.get(parent_path, folder_id) # Usar raíz si falla
                 if parent_id == folder_id and parent_path != '.':
                      print_warning(f"Subiendo {rel_path} a la raíz (no se encontró ID de {parent_path})")
-
-                file_name = os.path.basename(rel_path)
-                existing_id = remote_files.get(rel_path, {}).get('id')
                 
                 futures.append(executor.submit(
                     _upload_worker, creds, local_path, parent_id, file_name, existing_id, rel_path, total_uploads
                 ))
             
-            # Esperar a que todos los futuros completen
             concurrent.futures.wait(futures)
 
     if files_to_delete:
@@ -817,9 +843,8 @@ def upload_command(service, folder_path, creds, config):
             except Exception as e:
                 print_error(f"No se pudo eliminar {rel_path}: {e}")
     
-    print_info("\nActualizando metadatos...")
-    remote_files = get_remote_files_map(service, folder_id)
-    save_ruperto_metadata(folder_path, folder_id, folder_name, remote_files)
+    print_info(f"\nActualizando {RUPERTO_FILE}...")
+    save_ruperto_metadata(folder_path, folder_id, folder_name) # Actualizar 'last_sync'
     
     print(f"\n{Colors.GREEN}{Colors.BOLD}✓ Subida completada!{Colors.ENDC}\n")
 
@@ -856,10 +881,9 @@ def clone_command(folder_link, config):
     
     print_info(f"Destino: {Colors.BOLD}{destination}{Colors.ENDC}\n")
     
-    stats = {'current': 0, 'total': total_files}
-    
     # --- Iniciar descarga paralela ---
-    print(f"{Colors.BOLD}Descargando archivos ({config.get('parallel_downloads', 8)} hilos)...{Colors.ENDC}\n")
+    parallel_downloads = config.get('parallel_downloads', 8)
+    print(f"{Colors.BOLD}Descargando archivos ({parallel_downloads} hilos)...{Colors.ENDC}\n")
     
     print_info("Obteniendo mapa de archivos remotos...")
     remote_files = get_remote_files_map(service, folder_id)
@@ -871,11 +895,10 @@ def clone_command(folder_link, config):
 
     with _download_progress_lock:
         _download_progress['completed'] = 0
-        _download_progress['total'] = len(to_download)
     
     total_downloads = len(to_download)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.get('parallel_downloads', 8)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_downloads) as executor:
         futures = []
         for rel_path, remote_info in to_download:
             local_path = os.path.join(destination, rel_path.replace('/', os.sep))
@@ -883,9 +906,8 @@ def clone_command(folder_link, config):
         
         concurrent.futures.wait(futures)
     
-    print_info("\nCreando archivo de metadatos...")
-    # remote_files ya se obtuvo
-    save_ruperto_metadata(destination, folder_id, folder_name, remote_files)
+    print_info(f"\nCreando archivo {RUPERTO_FILE}...")
+    save_ruperto_metadata(destination, folder_id, folder_name) # Metadata mínima
     print_success(f"Archivo {RUPERTO_FILE} creado")
     
     print(f"\n{Colors.GREEN}{Colors.BOLD}✓ Clonación completada exitosamente!{Colors.ENDC}")
@@ -901,12 +923,12 @@ def show_help():
     print(f"    {Colors.DIM}Ejemplo: ruperto clone https://drive.google.com/drive/folders/...{Colors.ENDC}\n")
     
     print(f"  {Colors.CYAN}download{Colors.ENDC}")
-    print(f"    Descarga cambios desde Drive y sobreescribe archivos locales")
+    print(f"    Descarga solo los archivos nuevos o modificados (basado en MD5)")
     print(f"    {Colors.DIM}Debe ejecutarse dentro de una carpeta clonada{Colors.ENDC}")
-    print(f"    {Colors.YELLOW}⚠ Los cambios locales se perderán{Colors.ENDC}\n")
+    print(f"    {Colors.YELLOW}⚠ Los archivos locales modificados se sobreescribirán{Colors.ENDC}\n")
     
     print(f"  {Colors.CYAN}upload{Colors.ENDC}")
-    print(f"    Sube cambios locales a Drive y sobreescribe archivos remotos")
+    print(f"    Sube solo los archivos locales nuevos o modificados (basado en MD5)")
     print(f"    {Colors.DIM}Debe ejecutarse dentro de una carpeta clonada{Colors.ENDC}")
     print(f"    {Colors.YELLOW}⚠ Los archivos en Drive se sobreescribirán{Colors.ENDC}\n")
     
@@ -930,14 +952,14 @@ def main():
             clone_command(sys.argv[2], config)
         
         elif command == 'download':
-            print_header("RupertoCLI - Download")
+            print_header("RupertoCLI - Download (Sincronización MD5)")
             print_info("Autenticando con Google Drive...")
             creds = authenticate()
             service = build('drive', 'v3', credentials=creds)
             download_command(service, os.getcwd(), creds, config)
         
         elif command == 'upload':
-            print_header("RupertoCLI - Upload")
+            print_header("RupertoCLI - Upload (Sincronización MD5)")
             print_info("Autenticando con Google Drive...")
             creds = authenticate()
             service = build('drive', 'v3', credentials=creds)
