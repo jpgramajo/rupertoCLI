@@ -117,20 +117,28 @@ def authenticate():
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print_info("Refrescando token de autenticación...")
-            creds.refresh(Request())
-        else:
+        try:
+            if creds and creds.expired and creds.refresh_token:
+                print_info("Refrescando token de autenticación...")
+                creds.refresh(Request())
+            else:
+                # Si no hay credenciales o no se pueden refrescar, se lanza una excepción
+                # para forzar el flujo de autenticación completo.
+                raise Exception("No hay credenciales válidas para refrescar.")
+        except Exception as e:
+            print_warning(f"No se pudo refrescar el token ({e}). Se requiere nueva autenticación.")
+            
             if not os.path.exists(credentials_path):
                 print_error(f"No se encontró 'credentials.json' en {script_dir}")
-                print_info("Descarga 'credentials.json' desde Google Cloud Console")
+                print_info("Descarga 'credentials.json' desde Google Cloud Console y colócalo junto al ejecutable.")
                 sys.exit(1)
-            print_info("Iniciando proceso de autenticación...")
+                
+            print_info("Iniciando proceso de autenticación (esto abrirá tu navegador)...")
             flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
             creds = flow.run_local_server(port=0)
-        
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
+        finally:
+            with open(token_path, 'w') as token:
+                token.write(creds.to_json())
     
     return creds
 
@@ -981,4 +989,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
