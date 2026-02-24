@@ -135,7 +135,7 @@ def authenticate():
                 
             print_info("Iniciando proceso de autenticación (esto abrirá tu navegador)...")
             flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=8085)
         finally:
             with open(token_path, 'w') as token:
                 token.write(creds.to_json())
